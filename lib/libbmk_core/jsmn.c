@@ -21,6 +21,7 @@
  */
 
 #include <bmk-core/null.h>
+#define JSMN_PARENT_LINKS
 #include <bmk-core/jsmn.h>
 
 /**

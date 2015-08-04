@@ -82,7 +82,7 @@ typedef struct {
 void jsmn_init(jsmn_parser *parser);
 
 /**
- * Run JSON parser. It parses a JSON data string into and array of tokens, each describing
+ * Run JSON parser. It parses a JSON data string into an array of tokens, each describing
  * a single JSON object.
  */
 jsmnerr_t jsmn_parse(jsmn_parser *parser, const char *js, unsigned long len,

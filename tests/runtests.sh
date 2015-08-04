@@ -33,9 +33,21 @@ RUMPSTOP=$(pwd)/../app-tools/rumpstop
 export RUMPRUN_WARNING_STFU=please
 
 # TODO: use a more scalable way of specifying tests
-TESTS='hello/hello.bin basic/ctor_test.bin basic/pthread_test.bin
-	basic/tls_test.bin basic/misc_test.bin crypto/md5.bin'
-[ -x hello/hellopp.bin ] && TESTS="${TESTS} hello/hellopp.bin"
+TESTS="hello/hello.bin
+basic/ctor_test.bin
+basic/pthread_test.bin
+basic/tls_test.bin
+basic/misc_test.bin
+crypto/md5.bin
+shell/space check.bin
+shell/quote'\"check.bin
+shell/quote'check.bin
+shell/quote\"check.bin
+shell/semicolon;check.bin
+shell/dual\"quote\"check.bin
+shell/\"nested\\\"quote\\\"check\".bin"
+[ -x hello/hellopp.bin ] && TESTS="${TESTS}
+hello/hellopp.bin"
 
 STARTMAGIC='=== FOE RUMPRUN 12345 TES-TER 54321 ==='
 ENDMAGIC='=== RUMPRUN 12345 TES-TER 54321 EOF ==='
@@ -62,7 +74,7 @@ ddimage ()
 	[ ${imgsize} -eq $((${blocks}*512)) ] \
 	    || die imgsize \"${imgsize}\" not 512-byte aligned
 
-	dd if=${imgsource} of=${imgname} bs=512 count=${blocks} > /dev/null 2>&1
+	dd if="${imgsource}" of="${imgname}" bs=512 count=${blocks} > /dev/null 2>&1
 }
 
 runguest ()
@@ -74,7 +86,7 @@ runguest ()
 	# img2=$3
 
 	[ -n "${img1}" ] || die runtest without a disk image
-	cookie=$(${RUMPRUN} ${OPT_SUDO} ${STACK} -b ${img1} ${testprog} __test)
+	cookie=$(${RUMPRUN} ${OPT_SUDO} ${STACK} "${testprog}" -b "${img1}" __test)
 	if [ $? -ne 0 -o -z "${cookie}" ]; then
 		TEST_RESULT=ERROR
 		TEST_ECODE=-2
@@ -84,7 +96,7 @@ runguest ()
 
 		for x in $(seq 10) ; do
 			echo ">> polling, round ${x} ..."
-			set -- $(sed 1q < ${img1})
+			set -- $(sed 1q < "${img1}")
 
 			case ${1} in
 			OK)
@@ -116,7 +128,7 @@ getoutput ()
 
 	img=${1}
 	shift || die 'getoutput: not enough args'
-	sed -n "/${STARTMAGIC}/,/${ENDMAGIC}/p" < ${img} | sed -n '1n;$n;p'
+	sed -n "/${STARTMAGIC}/,/${ENDMAGIC}/p" < "${img}" | sed -n '1n;$n;p'
 }
 
 runtest ()
@@ -142,26 +154,28 @@ TESTDIR=$(mktemp -d testrun.XXXXXX)
 [ $? -eq 0 ] || die failed to create datadir for testrun
 
 TOPDIR=$(pwd)
-cd ${TESTDIR}
+cd "${TESTDIR}"
 
 rv=0
-for test in ${TESTS}; do
+while read -r test; do
 	echo ">> Running test: ${test}"
 
-	testunder="$(echo ${test} | sed s,/,_,g)"
+	testunder=$(echo "${test}" | sed s,/,_,g)
 	outputimg=${testunder}.disk1
 
-	ddimage ${outputimg} $((2*512))
-	runguest ${TOPDIR}/${test} ${outputimg}
+	ddimage "${outputimg}" $((2*512))
+	runguest "${TOPDIR}/${test}" "${outputimg}"
 
 	echo ">> Test output for ${test}"
-	getoutput ${outputimg}
+	getoutput "${outputimg}"
 	echo ">> End test outout"
 
-	echo ${test} ${TEST_RESULT} ${TEST_ECODE} >> test.log
+	echo "${test}" "${TEST_RESULT}" "${TEST_ECODE}" >> test.log
 	[ "${TEST_RESULT}" != 'SUCCESS' ] && rv=1
 	echo
-done
+done << EOF
+${TESTS}
+EOF
 
 echo '>> TEST LOG'
 cat test.log
