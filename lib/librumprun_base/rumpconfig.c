@@ -51,7 +51,6 @@
 #include <rump/netconfig.h>
 
 #include <rumprun-base/config.h>
-#include <rumprun-base/parseargs.h>
 
 #include <bmk-core/jsmn.h>
 
@@ -96,33 +95,67 @@ int rumprun_cmdline_argc;
 char **rumprun_cmdline_argv;
 
 static void
-makeargv(char *argvstr)
+makedefaultargv(void)
 {
 	char **argv;
-	int nargs;
 
 	assert(rumprun_cmdline_argc == 0 && rumprun_cmdline_argv == NULL);
 
-	rumprun_parseargs(argvstr, &nargs, 0);
-	argv = malloc(sizeof(*argv) * (nargs+2));
+	argv = malloc(sizeof(*argv) * 2);
 	if (argv == NULL)
 		errx(1, "could not allocate argv");
 
-	rumprun_parseargs(argvstr, &nargs, argv);
-	argv[nargs] = argv[nargs+1] = '\0';
+	argv[0] = "rumprun";
+	argv[1] = NULL;
 	rumprun_cmdline_argv = argv;
-	rumprun_cmdline_argc = nargs;
+	rumprun_cmdline_argc = 1;
+}
+
+static void
+makeargv(jsmntok_t *t, char *data, int argc)
+{
+	char **argv;
+
+	assert(rumprun_cmdline_argc == 0 && rumprun_cmdline_argv == NULL);
+
+	argv = malloc(sizeof(*argv) * (argc + 1));
+	if (argv == NULL)
+		errx(1, "could not allocate argv");
+
+	rumprun_cmdline_argc = argc;
+
+	argv[argc--] = NULL;
+	while (argc >= 0) {
+		argv[argc] = token2cstr(t + argc, data);
+		argc--;
+	}
+
+	rumprun_cmdline_argv = argv;
 }
 
 static int
 handle_cmdline(jsmntok_t *t, int left, char *data)
 {
 
-	T_CHECKTYPE(t, data, JSMN_STRING, __func__);
+	T_CHECKTYPE(t, data, JSMN_ARRAY, __func__);
+	/* discard the array token */
+	left--;
+	t++;
 
-	makeargv(token2cstr(t, data));
+	jsmntok_t *const argv_tokens = t;
+	/* if the next token parent changes, we are done parsing argv array */
+	const int parent = t->parent;
+	int argc = 0;
 
-	return 1;
+	while (argc < left && t->parent == parent) {
+		/* this array mimics argv, it must only contain strings */
+		T_CHECKTYPE(t, data, JSMN_STRING, __func__);
+		argc++;
+		t++;
+	}
+
+	makeargv(argv_tokens, data, argc);
+	return 1 + argc; /* array token + number of tokens inside the array */
 }
 
 static int
@@ -564,7 +597,7 @@ _rumprun_config(char *cmdline)
 	while (*cmdline != '{') {
 		if (*cmdline == '\0') {
 			warnx("could not find start of json.  no config?");
-			makeargv("rumprun");
+			makedefaultargv();
 			return;
 		}
 		cmdline++;

@@ -29,10 +29,12 @@
 # rumprun: "driver" script for running rumprun application stacks
 #
 
+set -u
+
 # default values
 MEM_DEFAULT=64
 
-if [ "${RUMPRUN_WARNING_STFU}" != 'please' ]; then
+if [ "${RUMPRUN_WARNING_STFU:-}" != 'please' ]; then
 	exec 3>&1 1>&2
 	echo
 	echo !!!
@@ -63,7 +65,7 @@ usage ()
 {
 
 	cat <<EOM
-usage: rumprun [script args] PLATFORM [guest args] APP [ -- ] [app args]
+usage: rumprun [script args] PLATFORM APP [guest args] [ -- ] [app args]
 
 PLATFORM is the rumprun runtime platform to use
     iso  : bake app and config into a bootable iso image
@@ -127,20 +129,87 @@ nuketmpdir ()
 setuptmpdir ()
 {
 
-	if [ -z "${TMPDIR}" ]; then
+	if [ -z "${TMPDIR:-}" ]; then
 		TMPDIR=$(mktemp -d /tmp/rumprun.XXXXXXXX)
 	else
-		[ ! -d "${TMPDIR}" ] || die ${TMPDIR} already exists
-		mkdir -p "${TMPDIR}" || die could not create ${TMPDIR}
-		chmod 700 "${TMPDIR}" \
-		    || { rm -rf "${TMPDIR}" ; die could not chmod ${TMPDIR}; }
+		[ ! -d "${TMPDIR}" ] || die "${TMPDIR} already exists"
+		mkdir -p "${TMPDIR}" || die "could not create ${TMPDIR}"
+		chmod 700 "${TMPDIR}" ||
+		    { rm -rf "${TMPDIR}" ; die "could not chmod ${TMPDIR}"; }
 	fi
 	trap nuketmpdir 0 INT TERM
 }
 
+command_add_parameters ()
+{
+	for parameter in "$@"; do
+		printf "%s\0" "${parameter}"
+	done
+}
+
+command_add_user_parameters ()
+{
+	# if the user supplied custom parameters (-g option for qemu), like
+	#   -g "-curses -someoption '...'"
+	# it will interpret it as
+	#   '-curses', '-someoption', '...'
+	eval "set -- $@"
+	command_add_parameters "$@"
+}
+
+# should only output on stdout the parameters for generating the final command
+command_worker ()
+{
+	local func
+
+	[ -n "${1:-}" ] || die 'command_worker(): setup function not set'
+	func=$1; shift
+
+	"${func}" "$@"
+}
+
+command_exec ()
+{
+	local program func
+
+	# program to execute
+	[ -n "${1:-}" ] || die 'command_exec(): program not set, nothing to execute'
+	program=$1; shift
+
+	# function to call that will write to pipe
+	[ -n "${1:-}" ] || die 'command_exec(): setup function not set'
+	func=$1; shift
+
+	if [ -n "${DUMPCMD:-}" ]; then
+		command_worker "${func}" "$@" | xargs -0 ${DUMPCMD} "${program}"
+	else
+		# everything should properly execute before even trying the command
+		command_worker "${func}" "$@" > /dev/null || die "an error occured"
+		command_worker "${func}" "$@" | {
+			if [ -z "${opt_interactive:-}" ]; then
+				xargs -0 "${program}" 1>/dev/null 2>&1
+			else
+				xargs -0 "${program}"
+			fi
+		}
+	fi
+}
+
+check_file ()
+{
+	local file
+	file=$(readlink -f "$1")
+	[ -z "${file}" -o ! -f "${file}" ] && die "$1: file does not exist"
+}
+
+quote_json ()
+{
+	printf "%s" "$1" | sed -e 's/\(["]\)/\\\1/g'
+}
+
 check_app ()
 {
-	[ -f "$1" ] || die "file not found: $1"
+	check_file "$1"
 
 	if ! grep -q __RuMpRuN_baked__ "$1"; then
 		die "$1: not a rumprun unikernel (did you forget rumpbake?)"
@@ -162,7 +231,9 @@ createif_qemu ()
 	ifbasename="${scratch%%,*}"
 	qemuargs="${scratch#*,}"
 
-	opt_netif="${opt_netif} -net nic,model=virtio ${qemuargs}"
+	command_add_parameters "-net" "nic,model=virtio"
+	command_add_user_parameters "${qemuargs}"
+
 	eval ${iftag}2ifname=${ifbasename}${nindex}
 	eval ${iftag}2cloner=false
 	nindex=$(expr $nindex + 1)
@@ -212,7 +283,7 @@ json_indent ()
 {
 
 	for x in $(seq ${json_depth}); do
-		printf '\t' >> ${TMPDIR}/json.cfg
+		printf '\t' >> "${TMPDIR}/json.cfg"
 	done
 }
 
@@ -220,7 +291,27 @@ json_append_ln ()
 {
 
 	json_indent
-	echo "$*, " >> ${TMPDIR}/json.cfg
+	echo "$*, " >> "${TMPDIR}/json.cfg"
+}
+
+json_append_array ()
+{
+	local array_name
+
+	array_name=$1;
+	shift
+	{
+		json_indent;
+		echo "\"${array_name}\": [, "
+		json_depth=$((${json_depth}+1))
+		for elem in "$@"; do
+			json_indent;
+			echo "\"${elem}\", "
+		done
+		json_depth=$((${json_depth}-1))
+		json_indent;
+		echo "], "
+	} >> "${TMPDIR}/json.cfg"
 }
 
 json_open_block ()
@@ -230,12 +321,25 @@ json_open_block ()
 	json_depth=$((${json_depth}+1))
 }
 
+json_begin ()
+{
+	> "${TMPDIR}/json.cfg"
+	json_open_block
+}
+
 json_finalize_block ()
 {
 
 	[ ${json_depth} -ne 0 ] || die internal json error
 	json_depth=$((${json_depth}-1))
 	json_append_ln }
+}
+
+json_end ()
+{
+	json_finalize_block
+	[ ${json_depth} -eq 0 ] ||
+		die "json creation failed, internal error (final depth: ${json_depth})"
 }
 
 # Detect the filesystem type of the image at $1.
@@ -271,23 +375,23 @@ json_store_netspec ()
 	json_open_block net
 
 	# XXX: should not assume vioif or -net user
-	json_append_ln	'"if":		"'$(eval echo \${${iftag}2ifname})'"'
+	json_append_ln	"\"if\":		\"$(eval echo \${${iftag}2ifname})\""
 
 	if $(eval \${${iftag}2cloner}); then
 		json_append_ln	'"cloner":	"'true'"'
 	fi
 
-	json_append_ln	'"type":	"'${iftype}'"'
-	json_append_ln	'"method":	"'${ifmethod}'"'
+	json_append_ln	"\"type\":	\"${iftype}\""
+	json_append_ln	"\"method\":	\"${ifmethod}\""
 
 	[ -n "${ifaddr}" ] || { json_finalize_block ; return ; }
 
-	json_append_ln	'"addr":	"'${ifaddr}'"'
-	json_append_ln	'"mask":	"'${ifmask}'"'
+	json_append_ln	"\"addr\":	\"${ifaddr}\""
+	json_append_ln	"\"mask\":	\"${ifmask}\""
 
-	[ -n "${ifgw}" ] || { json_finalize_block ; return ; }
+	[ -n "${ifgw:-}" ] || { json_finalize_block ; return ; }
 
-	json_append_ln	'"gw":		"'${ifgw}'"'
+	json_append_ln	"\"gw\":		\"${ifgw}\""
 
 	json_finalize_block
 }
@@ -315,7 +419,7 @@ parse_netspec ()
 			ifmask=${3#*/}
 			[ -n "${ifaddr}" ] || usage
 			[ -n "${ifmask}" ] || usage
-			ifgw=$4
+			ifgw=${4:-}
 			;;
 		*)
 			return 1
@@ -343,13 +447,13 @@ json_store_xen_blkspec ()
 	json_open_block blk
 
 	json_append_ln	'"source":	"'etfs'"'
-	json_append_ln	'"path":	"'${vdev}'"'
+	json_append_ln	"\"path\":	\"${vdev}\""
 
 	# if the image does not need to be mounted, we're done
 	[ -n "${mountpoint}" ] || { json_finalize_block ; return ; }
 
-	json_append_ln	'"fstype":	"'${fstype}'"'
-	json_append_ln	'"mountpoint":	"'${mountpoint}'"'
+	json_append_ln	"\"fstype\":	\"${fstype}\""
+	json_append_ln	"\"mountpoint\":	\"${mountpoint}\""
 
 	json_finalize_block
 }
@@ -358,7 +462,7 @@ json_store_qemu_blkspec ()
 {
 
 	# XXX: should not generate the interface here
-	opt_drivespec="${opt_drivespec} -drive if=virtio,file=${image}"
+	command_add_parameters "-drive" "if=virtio,file=${image}"
 
 	# if the image does not need to be mounted, we're done
 	[ -n "${mountpoint}" ] || return
@@ -367,9 +471,9 @@ json_store_qemu_blkspec ()
 
 	# XXX: should not assume ld (virtio)
 	json_append_ln	'"source":	"'dev'"'
-	json_append_ln	'"path":	"'/dev/ld${bindex}a'"'
-	json_append_ln	'"fstype":	"'${fstype}'"'
-	json_append_ln	'"mountpoint":	"'${mountpoint}'"'
+	json_append_ln	"\"path\":	\"/dev/ld${bindex}a\""
+	json_append_ln	"\"fstype\":	\"${fstype}\""
+	json_append_ln	"\"mountpoint\":	\"${mountpoint}\""
 
 	json_finalize_block
 }
@@ -381,19 +485,19 @@ json_store_iso_blkspec ()
 
 	# XXX: might have accidental clashes due to images from
 	# many source subdirectories
-	[ ! -f "${ISODIR}/images/$(basename ${image})" ] \
-	    || die image \"${image}\" already exists in destdir
-	cp ${image} "${ISODIR}/images/"
+	[ ! -f "${ISODIR}/images/$(basename "${image}")" ] ||
+	    die "image \"${image}\" already exists in destdir"
+	cp "${image}" "${ISODIR}/images/"
 
 	# well, this is a bit questionable, but ...
 	[ -n "${mountpoint}" ] || return
 
 	json_open_block blk
 
-	json_append_ln	'"source":	"'vnd'"'
-	json_append_ln	'"path":	"'images/$(basename ${image})'"'
-	json_append_ln	'"fstype":	"'${fstype}'"'
-	json_append_ln	'"mountpoint":	"'${mountpoint}'"'
+	json_append_ln	"\"source\":	\"vnd\""
+	json_append_ln	"\"path\":	\"images/$(basename "${image}")\""
+	json_append_ln	"\"fstype\":	\"$fstype\""
+	json_append_ln	"\"mountpoint\":	\"$mountpoint\""
 
 	json_finalize_block
 }
@@ -416,17 +520,17 @@ parse_blkspec ()
 	spec=$1
 
 	image_path=${spec%,*}
-	[ -n "$image_path" ] || usage
-	image=$(readlink -f "$image_path")
-	[ -f "$image" ] || die "File $image_path does not exist"
-	mountpoint=$(echo "$spec" | sed -n 's/.*,\(.*\)/\1/p')
+	[ -n "${image_path}" ] || usage
+	image=${image_path}
+	check_file "${image}"
+	mountpoint=$(echo "${spec}" | sed -n 's/.*,\(.*\)/\1/p')
 
 	if [ -n "$mountpoint" ]; then
-		fstype=$(detect_fstype "$image")
-		[ $? -ne 0 ] && die "File $image: unknown fstype"
+		fstype=$(detect_fstype "${image}")
+		[ $? -ne 0 ] && die "File ${image}: unknown fstype"
 	fi
 
-	${store_blkspec}
+	"${store_blkspec}"
 	bindex=$(expr $bindex + 1)
 }
 
@@ -445,6 +549,11 @@ run_xen ()
 		fi
 	done
 
+	app=$1
+	shift
+	check_app "$app"
+	opt_name=rumprun-$(basename "$app")
+
 	store_blkspec=json_store_xen_blkspec
 	store_netspec=json_store_netspec
 
@@ -458,11 +567,10 @@ run_xen ()
 	opt_destroy='on_poweroff="preserve"'
 	opt_destroy_crash='on_crash="preserve"'
 	opt_mem=${MEM_DEFAULT}
-	opt_name=
 	opt_debug=
 	sudo=''
 
-	json_open_block
+	json_begin
 
 	while getopts "${guestopts}" opt; do
 		case "$opt" in
@@ -525,25 +633,18 @@ run_xen ()
 
 	# Remaining arguments belong to the application.
 	shift $((OPTIND-1))
-	[ "$1" = "--" ] && shift
-	[ $# -lt 1 ] && usage
 
 	# kernfs is always present on Xen
 	json_store_kernfs
 
-	json_append_ln "\"cmdline\": \""$@"\""
-	[ -n "${opt_name}" ] && json_append_ln "\"hostname\": \""${opt_name}"\""
-	json_finalize_block
+	json_append_array "cmdline" "$(quote_json "${app}")" "$@"
+	[ -n "${opt_name}" ] && json_append_ln "\"hostname\": \"${opt_name}\""
+	json_end
 
-	name=${opt_name:-rumprun-$(basename "$1")}
-	app=$(readlink -f "$1")
-	[ -f "$app" ] || die "rumprun unikernel $1 does not exist"
-	shift
-	check_app ${app}
 	# Generate xl configuration file.
 	cat <<EOM >"${TMPDIR}/xr.conf"
 kernel="${app}"
-name="${name}"
+name="${opt_name}"
 vcpus=1
 memory=${opt_mem}
 ${opt_destroy}
@@ -556,14 +657,14 @@ EOM
 	fi
 
 	# Create the domain and leave it paused so that we can get its domid.
-	if ! ${DUMPCMD} ${sudo} xl create -p ${conf} >/dev/null; then
+	if ! ${DUMPCMD} ${sudo} xl create -p "${conf}" >/dev/null; then
 		die xl create failed
 	fi
-	domid=$(${DUMPCMD} ${sudo} xl domid ${name})
+	domid=$(${DUMPCMD} ${sudo} xl domid "${opt_name}")
 	# Write provisioning information for domain to xenstore.
 	prefix=/local/domain/${domid}/rumprun
 	${DUMPCMD} ${sudo} xenstore-write \
-	    "${prefix}/cfg" "$(cat ${TMPDIR}/json.cfg)"
+	    "${prefix}/cfg" "$(cat "${TMPDIR}/json.cfg")"
 
 	nuketmpdir
 
@@ -585,24 +686,23 @@ EOM
 	fi
 }
 
-run_qemu ()
+configure_qemu ()
 {
+	local opt_mem
 
 	store_blkspec=json_store_qemu_blkspec
 	store_netspec=json_store_netspec
 
 	opt_interactive=
-	opt_drivespec=
-	opt_debug=
-	opt_pause=
-	opt_netif=
-	opt_guestargs=
 	opt_mem=${MEM_DEFAULT}
 
-	json_open_block
+	json_begin
 
 	variant=$1
-	shift
+	app_file=$2
+	pid_file=$3
+	shift 3
+
 	while getopts "${guestopts}" opt; do
 		case "$opt" in
 		b)
@@ -612,14 +712,14 @@ run_qemu ()
 			die -d not supported on qemu/kvm
 			;;
 		D)
-			opt_debug="-gdb tcp::${OPTARG}"
+			command_add_parameters "-gdb" "tcp::$OPTARG"
 			;;
 		e)
+			# an array could be better
 			json_append_ln "\"env\": \"${OPTARG}\""
 			;;
 		g)
-			# toimii ku gunan vessa
-			opt_guestargs="${opt_guestargs} ${OPTARG}"
+			command_add_user_parameters "${OPTARG}"
 			;;
 		i)
 			opt_interactive=1
@@ -642,7 +742,7 @@ run_qemu ()
 			opt_name=${OPTARG}
 			;;
 		p)
-			opt_pause="-S"
+			command_add_parameters "-S"
 			;;
 		W)
 			parse_newnetspec "${OPTARG}" || usage
@@ -655,41 +755,52 @@ run_qemu ()
 	shift $((${OPTIND}-1))
 
 	if [ "${variant}" = "kvm" ]; then
-		opt_kvm="-enable-kvm -cpu host"
+		command_add_parameters "-enable-kvm" "-cpu" "host"
 	else
-		opt_kvm=-no-kvm
+		command_add_parameters "-no-kvm"
 	fi
 
-	json_append_ln "\"cmdline\": \""$@"\""
-	[ -n "${opt_name}" ] && json_append_ln "\"hostname\": \""${opt_name}"\""
-	json_finalize_block
-
-	# internal check
-	[ ${json_depth} -eq 0 ] || die internal error, final depth ${json_depth}
+	json_append_array "cmdline" "$(quote_json "${app_file}")" "$@"
+	[ -n "${opt_name:-}" ] && json_append_ln "\"hostname\": \"${opt_name}\""
+	json_end
 
 	json_coma="$(sed 's/,/,,/g' < "${TMPDIR}/json.cfg")"
 
-	[ -n "${opt_netif}" ] || opt_netif="-net none"
+	command_add_parameters "-m" "${opt_mem}"
+	command_add_parameters "-kernel" "${app_file}"
+	command_add_parameters "-append" "${json_coma}"
 
-	check_app $1
+	if [ -z "$opt_interactive" ]; then
+		command_add_parameters "-pidfile" "${pid_file}" "-daemonize"
+		command_add_parameters "-display" "none"
+	fi
+}
+
+run_qemu ()
+{
+	local variant app_file pid_file
+
+	variant=$1
+	app_file=$2
+	shift 2
+	pid_file="${TMPDIR}/qemu.pid"
+
+	check_app "${app_file}"
 
 	# XXX: using host objdump here is wrong, but xen uses it too,
 	# and both offenses should be easy to fix at the same time
-	if objdump -f ${1} | grep -q elf64; then
+	if objdump -f "${app_file}" | grep -q "elf64"; then
 		qemu=qemu-system-x86_64
 	else
 		qemu=qemu-system-i386
 	fi
 
-	qemucmd="${DUMPCMD} ${qemu} ${opt_netif} ${opt_kvm}		\
-	    ${opt_drivespec} ${opt_debug} ${opt_pause} -m ${opt_mem}	\
-	    ${opt_guestargs} -kernel $1"
-	if [ -n "$opt_interactive" ]; then
-		${qemucmd} -append "${json_coma}"
-	else
-		qemucmd="${qemucmd} -display none"
-		${qemucmd} -append "${json_coma}" 1>/dev/null 2>&1 &
-		echo qemu:$!
+	command_exec "${qemu}" \
+				 configure_qemu "${variant}" "${app_file}" "${pid_file}" "$@"
+
+	if [ -f "${pid_file}" ]; then
+		echo "qemu:$(cat "${pid_file}")"
+		return
 	fi
 }
 
@@ -699,14 +810,14 @@ bake_iso ()
 	type xorriso >/dev/null || die bake_iso needs xorriso
 	type grub-mkrescue >/dev/null || die bake_iso needs grub-mkrescue
 
+	bootimage=$1
+	check_app "${bootimage}"
+	shift
+
 	store_blkspec=json_store_iso_blkspec
 	store_netspec=json_store_netspec
 
-	opt_interactive=
-	opt_drivespec=
-	opt_debug=
-	opt_pause=
-	opt_netif=
+	opt_name=rumprun-"$(echo "${bootimage}" | tr / _)"
 	opt_mem=${MEM_DEFAULT}
 
 	blk_specified=false
@@ -714,7 +825,7 @@ bake_iso ()
 	ISODIR="${TMPDIR}/iso"
 	mkdir -p "${ISODIR}"
 
-	json_open_block
+	json_begin
 
 	while getopts "${guestopts}" opt; do
 		case "$opt" in
@@ -758,26 +869,26 @@ bake_iso ()
 		esac
 	done
 	shift $((${OPTIND}-1))
-	bootimage=$1
-	check_app ${bootimage}
-	: ${opt_name:=rumprun-$(echo ${bootimage} | tr / _).iso}
 
-	[ ! -f ${opt_name} ] || die target ${opt_name} already exists
+	opt_name=${opt_name%.iso}
+	iso_name=${opt_name}.iso
+	[ ! -f "${iso_name}" ] || die "target ${iso_name} already exists"
+	json_append_ln "\"hostname\": \"${opt_name}\""
 
-	json_append_ln "\"cmdline\": \""$@"\""
-	[ -n "${opt_name}" ] && json_append_ln "\"hostname\": \""${opt_name}"\""
-	json_finalize_block
-	[ ${json_depth} -eq 0 ] || die internal error, final depth ${json_depth}
+	json_append_array "cmdline" "$(quote_json "${bootimage}")" "$@"
+	json_end
 
 	# create the iso directory structure
 	mkdir -p "${ISODIR}/boot/grub"
-	printf 'set timeout=0\n' > "${ISODIR}/boot/grub/grub.cfg"
-	printf 'menuentry "rumpkernel" {\n' >> "${ISODIR}/boot/grub/grub.cfg"
-	printf '\tmultiboot /boot/%s ROOTFSCFG=/json.cfg\n}\n' $(basename $1) \
-	    >> "${ISODIR}/boot/grub/grub.cfg"
-	cp ${bootimage} "${ISODIR}/boot"
+	cat << EOF > "${ISODIR}/boot/grub/grub.cfg"
+set timeout=0
+menuentry "rumpkernel" {
+	multiboot /boot/$(basename "${bootimage}") ROOTFSCFG=/json.cfg
+}
+EOF
+	cp "${bootimage}" "${ISODIR}/boot"
 	cp "${TMPDIR}/json.cfg" "${ISODIR}"
-	grub-mkrescue "${ISODIR}" -o ${opt_name}
+	grub-mkrescue "${ISODIR}" -o "${iso_name}"
 }
 
 if [ $# -lt 2 ]; then
@@ -812,7 +923,7 @@ shift
 
 setuptmpdir
 
-case ${platform} in
+case "${platform}" in
 xen)
 	run_xen "$@"
 	;;
