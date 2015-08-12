@@ -51,7 +51,7 @@ die ()
 	exit 1
 }
 
-scriptopts='DhSt:T:'
+scriptopts='DhSt:T:P:'
 guestopts='b:dD:e:g:iI:M:n:N:pW:'
 
 # script option default values
@@ -65,18 +65,12 @@ usage ()
 {
 
 	cat <<EOM
-usage: rumprun [script args] PLATFORM APP [guest args] [ -- ] [app args]
-
-PLATFORM is the rumprun runtime platform to use
-    iso  : bake app and config into a bootable iso image
-    kvm  : hw guest via qemu -enable-kvm
-    qemu : hw guest via qemu -no-kvm
-    xen  : xen guest via xl(1)
+usage: rumprun [script args] [ -- ] APP [guest args] [ -- ] [app args]
 
 APP is the binary to rumprun.  app args are processed by APP.
 
 script args are:
-	[-h] [-DS] [-t tmpdir] [-T tmpdir]
+	[-h] [-DS] [-t tmpdir] [-T tmpdir] [-P platform]
 
    -h display this message
 
@@ -84,6 +78,12 @@ script args are:
    -S execute sudo where potentially necessary
    -t use tmpdir as dir for temp files (default: /tmp/rumprun.XXXXXXXX)
    -T same as -t, except do not remove temporary directory
+
+platform is autodetected (xen or qemu) but you could specify it:
+   -P iso  bake app and config into a bootable iso image
+   -P kvm  hw guest via qemu -enable-kvm
+   -P qemu hw guest via qemu -no-kvm
+   -P xen  xen guest via xl(1)
 
 guest args are:
 	[-dip] [-b blkspec] [-D port] [-e VAR[=VALUE]] [-g args]
@@ -551,7 +551,6 @@ run_xen ()
 
 	app=$1
 	shift
-	check_app "$app"
 	opt_name=rumprun-$(basename "$app")
 
 	store_blkspec=json_store_xen_blkspec
@@ -785,8 +784,6 @@ run_qemu ()
 	shift 2
 	pid_file="${TMPDIR}/qemu.pid"
 
-	check_app "${app_file}"
-
 	# XXX: using host objdump here is wrong, but xen uses it too,
 	# and both offenses should be easy to fix at the same time
 	if objdump -f "${app_file}" | grep -q "elf64"; then
@@ -811,7 +808,6 @@ bake_iso ()
 	type grub-mkrescue >/dev/null || die bake_iso needs grub-mkrescue
 
 	bootimage=$1
-	check_app "${bootimage}"
 	shift
 
 	store_blkspec=json_store_iso_blkspec
@@ -895,6 +891,8 @@ if [ $# -lt 2 ]; then
 	usage
 fi
 
+platform=
+
 while getopts "${scriptopts}" opt; do
 	case "${opt}" in
 	D)
@@ -913,15 +911,19 @@ while getopts "${scriptopts}" opt; do
 		PRESERVETMPDIR=true
 		TMPDIR="${OPTARG}"
 		;;
+	P)	platform="${OPTARG}"
+		;;
 	esac
 done
 shift $((${OPTIND}-1))
 OPTIND=1
 
-platform="$1"
-shift
-
 setuptmpdir
+check_app "$1"
+
+if [ -z "${platform}" ]; then
+    platform=$(grep -aEo '__RuMpRuN_platform_[[:alpha:]]+__' "$1" | cut -d '_' -f 5)
+fi
 
 case "${platform}" in
 xen)
@@ -933,7 +935,7 @@ iso)
 kvm)
 	run_qemu kvm "$@"
 	;;
-qemu)
+qemu|hw)
 	run_qemu qemu "$@"
 	;;
 *)
